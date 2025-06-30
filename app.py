@@ -594,8 +594,8 @@ def prepare_model_args(request_body):
     
     return model_args
 
-async def send_chat_request(request):
-    model_args = prepare_model_args(request)
+async def send_chat_request(request_body):
+    model_args = prepare_model_args(request_body)
 
     # User_id based routing to different AzureOpenAI clients
     authenticated_user = get_authenticated_user_details(request_headers=request.headers)
