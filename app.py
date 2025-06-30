@@ -90,6 +90,26 @@ AZURE_OPENAI_EMBEDDING_ENDPOINT = os.environ.get("AZURE_OPENAI_EMBEDDING_ENDPOIN
 AZURE_OPENAI_EMBEDDING_KEY = os.environ.get("AZURE_OPENAI_EMBEDDING_KEY")
 AZURE_OPENAI_EMBEDDING_NAME = os.environ.get("AZURE_OPENAI_EMBEDDING_NAME", "")
 
+# Alternative Model Settings for two-model setup
+AZURE_OPENAI_ALT_MODEL = os.environ.get("AZURE_OPENAI_ALT_MODEL")
+AZURE_OPENAI_KEY_2 = os.environ.get("AZURE_OPENAI_KEY_2")
+AZURE_OPENAI_RESOURCE_2 = os.environ.get("AZURE_OPENAI_RESOURCE_2")
+AZURE_OPENAI_ENDPOINT_2 = os.environ.get("AZURE_OPENAI_ENDPOINT_2")
+AZURE_OPENAI_PREVIEW_API_VERSION_2 = os.environ.get("AZURE_OPENAI_PREVIEW_API_VERSION_2", "2023-12-01-preview")
+
+# Parse comma-separated user IDs for alternative model routing
+def parse_alt_model_user_ids():
+    user_ids_str = os.environ.get("AZURE_OPENAI_ALT_MODEL_USER_IDS", "")
+    if not user_ids_str.strip():
+        return []
+    try:
+        return [user_id.strip() for user_id in user_ids_str.split(",") if user_id.strip()]
+    except Exception as e:
+        logging.warning(f"Failed to parse AZURE_OPENAI_ALT_MODEL_USER_IDS: {e}")
+        return []
+
+AZURE_OPENAI_ALT_MODEL_USER_IDS = parse_alt_model_user_ids()
+
 # CosmosDB Mongo vcore vector db Settings
 AZURE_COSMOSDB_MONGO_VCORE_CONNECTION_STRING = os.environ.get("AZURE_COSMOSDB_MONGO_VCORE_CONNECTION_STRING")  #This has to be secure string
 AZURE_COSMOSDB_MONGO_VCORE_DATABASE = os.environ.get("AZURE_COSMOSDB_MONGO_VCORE_DATABASE")
@@ -200,7 +220,11 @@ SHOULD_USE_DATA = should_use_data()
 # Initialize Azure OpenAI Client
 def init_openai_client(use_data=SHOULD_USE_DATA):
     azure_openai_client = None
+    azure_openai_client_2 = None
+    
     try:
+        # Initialize default OpenAI client
+        
         # Endpoint
         if not AZURE_OPENAI_ENDPOINT and not AZURE_OPENAI_RESOURCE:
             raise Exception("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_RESOURCE is required")
@@ -241,7 +265,58 @@ def init_openai_client(use_data=SHOULD_USE_DATA):
                 default_headers=default_headers,
                 azure_endpoint=endpoint
             )
-        return azure_openai_client
+
+        # If second model is provided, set up another openai client
+        if AZURE_OPENAI_ALT_MODEL:
+            if not isinstance(AZURE_OPENAI_ALT_MODEL_USER_IDS, list):
+                logging.error(f"AZURE_OPENAI_ALT_MODEL_USER_IDS not correctly parsed as list. Parsing yielded type {type(AZURE_OPENAI_ALT_MODEL_USER_IDS)}")
+                raise ValueError("AZURE_OPENAI_ALT_MODEL_USER_IDS not parsed as list")
+
+            logging.debug(f"\n----------\nAZURE_OPENAI_ALT_MODEL is not None\nInitializing two AzureOpenAI models")
+            logging.debug(f"Number of ALT_MODEL_USER_IDS : {len(AZURE_OPENAI_ALT_MODEL_USER_IDS)}")
+            logging.debug(f"First 10 ALT_MODEL_USER_IDS : {AZURE_OPENAI_ALT_MODEL_USER_IDS[:10]}\n----------\n")
+        
+            # Endpoint 2
+            if not AZURE_OPENAI_ENDPOINT_2 and not AZURE_OPENAI_RESOURCE_2:
+                raise Exception("AZURE_OPENAI_ENDPOINT_2 or AZURE_OPENAI_RESOURCE_2 is required")
+
+            endpoint_2 = AZURE_OPENAI_ENDPOINT_2 if AZURE_OPENAI_ENDPOINT_2 else f"https://{AZURE_OPENAI_RESOURCE_2}.openai.azure.com/"
+
+            # Authentication 2
+            aoai_api_key_2 = AZURE_OPENAI_KEY_2
+            ad_token_provider_2 = None
+            if not aoai_api_key_2:
+                logging.debug("No AZURE_OPENAI_KEY_2 found, using Azure AD auth")
+                ad_token_provider_2 = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
+            
+            # Deployment 2
+            deployment_2 = AZURE_OPENAI_ALT_MODEL
+            if not deployment_2:
+                raise Exception("AZURE_OPENAI_ALT_MODEL is required")
+
+            if use_data:
+                base_url_2 = f"{str(endpoint_2).rstrip('/')}/openai/deployments/{deployment_2}/extensions"
+                azure_openai_client_2 = AsyncAzureOpenAI(
+                    base_url=str(base_url_2),
+                    api_version=AZURE_OPENAI_PREVIEW_API_VERSION_2,
+                    api_key=aoai_api_key_2,
+                    azure_ad_token_provider=ad_token_provider_2,
+                    default_headers=default_headers,
+                )
+            else:
+                azure_openai_client_2 = AsyncAzureOpenAI(
+                    api_version=AZURE_OPENAI_PREVIEW_API_VERSION_2,
+                    api_key=aoai_api_key_2,
+                    azure_ad_token_provider=ad_token_provider_2,
+                    default_headers=default_headers,
+                    azure_endpoint=endpoint_2
+                )
+
+            return [azure_openai_client, azure_openai_client_2]
+        
+        else:
+            return azure_openai_client
+            
     except Exception as e:
         logging.exception("Exception in Azure OpenAI initialization", e)
         azure_openai_client = None
@@ -522,8 +597,32 @@ def prepare_model_args(request_body):
 async def send_chat_request(request):
     model_args = prepare_model_args(request)
 
+    # User_id based routing to different AzureOpenAI clients
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    logging.debug(f"\n----- AzureOpenAI Routing ------\nuser_id = user_principal_id = {user_id}\n----------")
+
     try:
-        azure_openai_client = init_openai_client()
+        azure_openai_clients = init_openai_client()
+        
+        if isinstance(azure_openai_clients, list):
+            if user_id in AZURE_OPENAI_ALT_MODEL_USER_IDS:
+                # Use alternative model for this user
+                model_args["model"] = str(AZURE_OPENAI_ALT_MODEL).strip()
+                azure_openai_client = azure_openai_clients[1]
+                logging.debug(f"\n----------------------\n\nUserId is in ALT_MODEL_USER_IDS\nUsing deployment {model_args.get('model','ERROR')}\n\n----------------")
+            else:
+                # Use primary model for this user
+                azure_openai_client = azure_openai_clients[0]
+                logging.debug(f"\n----------------------\n\nUserId is NOT in ALT_MODEL_USER_IDS\nUsing deployment {model_args.get('model','ERROR')}\n\n----------------")
+        elif isinstance(azure_openai_clients, AsyncAzureOpenAI):
+            # Single model setup
+            azure_openai_client = azure_openai_clients
+            logging.debug(f"\n----------------------\n\nNo ALT_MODEL provided\nUsing deployment {model_args.get('model','ERROR')}\n\n----------------")
+        else:
+            logging.error(f"Unexpected return from init_openai_client")
+            raise ValueError("Invalid Azure OpenAI client configuration in init_openai_client")
+
         response = await azure_openai_client.chat.completions.create(**model_args)
 
     except Exception as e:
@@ -932,17 +1031,33 @@ async def generate_title(conversation_messages):
     messages.append({'role': 'user', 'content': title_prompt})
 
     try:
-        azure_openai_client = init_openai_client(use_data=False)
-        response = await azure_openai_client.chat.completions.create(
-            model=AZURE_OPENAI_MODEL,
-            messages=messages,
-            temperature=1,
-            max_tokens=64
-        )
+        azure_openai_clients = init_openai_client(use_data=False)
         
-        title = json.loads(response.choices[0].message.content)['title']
+        if isinstance(azure_openai_clients, list):
+            # For simplicity, the first model is always used for title generation
+            azure_openai_client = azure_openai_clients[0] 
+            response = await azure_openai_client.chat.completions.create(
+                model=AZURE_OPENAI_MODEL,
+                messages=messages,
+                temperature=1,
+                max_tokens=64
+            )
+            title = json.loads(response.choices[0].message.content)['title']
+        elif isinstance(azure_openai_clients, AsyncAzureOpenAI):
+            azure_openai_client = azure_openai_clients
+            response = await azure_openai_client.chat.completions.create(
+                model=AZURE_OPENAI_MODEL, 
+                messages=messages, 
+                temperature=1, 
+                max_tokens=64
+            )
+            title = json.loads(response.choices[0].message.content)['title']
+        else:
+            logging.warning("init_openai_client() returns neither list nor single instance of AsyncAzureOpenAI")
+            raise ValueError("Invalid Azure OpenAI client configuration")
         return title
     except Exception as e:
+        logging.exception("Exception while generating title", e)
         return messages[-2]['content']
 
 
